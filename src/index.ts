@@ -1,59 +1,30 @@
 import 'dotenv/config';
-import express from 'express';
-import type { Request, Response } from 'express';
-import cors from 'cors';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createServer } from './server.js';
-import { createAPIRoutes } from './api/index.js';
+import { createApp } from './app.js';
 
-// Configuration
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = process.env.HOST || 'localhost';
-
-// Create MCP server
+const PORT = Number(process.env.PORT ?? '3002');
+const HOST = process.env.HOST ?? '127.0.0.1';
+if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) || !Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error('Phase 0 permits only a loopback listener and valid port');
+}
+// No default password, public enrollment, deployment, or provider calls at startup.
+const app = createApp();
+const httpServer = app.listen(PORT, HOST, () => console.error(`Local API listening on ${HOST}:${PORT}`));
+httpServer.maxConnections = 128;
+httpServer.requestTimeout = 30_000;
+httpServer.headersTimeout = 10_000;
 const server = createServer();
-
-// Create Express app
-const app = express();
-
-// Enable CORS for browser access (JobOS)
-app.use(cors({
-    origin: true, // Allow all origins in dev, configure for production
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-
-// Parse JSON bodies
-app.use(express.json({ limit: '10mb' }));
-
-// Health check endpoint
-app.get('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', server: 'letsmcp', version: '2.0.0' });
-});
-
-// Mount API routes
-app.use('/api', createAPIRoutes());
-
-// Start HTTP server
-const httpServer = app.listen(PORT, HOST, () => {
-    console.error(`HTTP Server running at http://${HOST}:${PORT}`);
-    console.error(`Health check: http://${HOST}:${PORT}/health`);
-    console.error(`API endpoints: http://${HOST}:${PORT}/api/*`);
-    console.error(`\nMCP Server ready on stdio transport`);
-    console.error(`Configure in Claude Desktop/Antigravity as a stdio server`);
-});
-
-// Start stdio transport for MCP communication
 const transport = new StdioServerTransport();
-server.connect(transport).catch((error) => {
-    console.error('Failed to start MCP server:', error);
-    process.exit(1);
+server.connect(transport).catch(() => {
+    console.error('MCP transport failed');
+    httpServer.close();
+    process.exitCode = 1;
 });
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-    console.error('\nShutting down...');
+async function shutdown() {
     httpServer.close();
     await server.close();
-    process.exit(0);
-});
+    process.exitCode = 0;
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

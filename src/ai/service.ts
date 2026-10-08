@@ -1,6 +1,6 @@
 /**
  * Unified AI Service
- * Manages multiple AI providers with automatic fallback
+ * Uses one explicitly selected AI provider without third-party fallback
  */
 
 import type { AIProvider, AIServiceConfig, JobDetails, ResumeAnalysis, EmailDraftContext, EmailDraft, CompanyResearch, ParsedJobDescription, ParsedProfile } from './types.js';
@@ -9,7 +9,6 @@ import { GroqProvider, ClaudeProvider, GeminiProvider } from './providers/index.
 export class AIService {
     private providers: Map<string, AIProvider> = new Map();
     private defaultProvider: string = 'groq';
-    private providerOrder: string[] = ['groq', 'claude', 'gemini'];
 
     constructor(config: AIServiceConfig) {
         // Initialize providers based on config
@@ -23,24 +22,6 @@ export class AIService {
             this.providers.set('gemini', new GeminiProvider(config.gemini.apiKey, config.gemini.model));
         }
 
-        if (config.defaultProvider) {
-            this.defaultProvider = config.defaultProvider;
-        }
-    }
-
-    /**
-     * Update provider configuration at runtime
-     */
-    updateConfig(config: Partial<AIServiceConfig>) {
-        if (config.groq?.apiKey) {
-            this.providers.set('groq', new GroqProvider(config.groq.apiKey, config.groq.model));
-        }
-        if (config.claude?.apiKey) {
-            this.providers.set('claude', new ClaudeProvider(config.claude.apiKey, config.claude.model));
-        }
-        if (config.gemini?.apiKey) {
-            this.providers.set('gemini', new GeminiProvider(config.gemini.apiKey, config.gemini.model));
-        }
         if (config.defaultProvider) {
             this.defaultProvider = config.defaultProvider;
         }
@@ -67,47 +48,29 @@ export class AIService {
         if (name) {
             return this.providers.get(name);
         }
-        return this.providers.get(this.defaultProvider) || this.providers.values().next().value;
+        return this.providers.get(this.defaultProvider);
     }
 
-    /**
-     * Execute with fallback - tries providers in order until one succeeds
-     */
-    private async executeWithFallback<T>(
+    /** Never resend user data to a different provider after an upstream failure. */
+    private async execute<T>(
         operation: (provider: AIProvider) => Promise<T>,
         preferredProvider?: string
     ): Promise<{ result: T; provider: string }> {
-        const errors: string[] = [];
-
-        // Build provider order: preferred first, then default, then others
-        const order = [...new Set([
-            preferredProvider,
-            this.defaultProvider,
-            ...this.providerOrder
-        ].filter(Boolean) as string[])];
-
-        for (const providerName of order) {
-            const provider = this.providers.get(providerName);
-            if (!provider || !provider.isConfigured()) continue;
-
-            try {
-                const result = await operation(provider);
-                return { result, provider: providerName };
-            } catch (error) {
-                const msg = error instanceof Error ? error.message : String(error);
-                errors.push(`${providerName}: ${msg}`);
-                console.error(`Provider ${providerName} failed:`, msg);
-            }
+        const name = preferredProvider ?? this.defaultProvider;
+        const provider = this.providers.get(name);
+        if (!provider || !provider.isConfigured()) throw new Error('Selected AI provider is not configured');
+        try {
+            return { result: await operation(provider), provider: name };
+        } catch {
+            throw new Error('AI provider request failed');
         }
-
-        throw new Error(`All providers failed:\n${errors.join('\n')}`);
     }
 
     /**
      * Generate text using AI
      */
     async generateText(prompt: string, preferredProvider?: string): Promise<{ text: string; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.generateText(prompt),
             preferredProvider
         );
@@ -118,7 +81,7 @@ export class AIService {
      * Extract job details from text
      */
     async extractJobDetails(text: string, preferredProvider?: string): Promise<{ data: JobDetails; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.extractJobDetails(text),
             preferredProvider
         );
@@ -133,7 +96,7 @@ export class AIService {
         resumeText: string,
         preferredProvider?: string
     ): Promise<{ data: ResumeAnalysis; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.analyzeResume(jobDescription, resumeText),
             preferredProvider
         );
@@ -147,7 +110,7 @@ export class AIService {
         context: EmailDraftContext,
         preferredProvider?: string
     ): Promise<{ data: EmailDraft; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.draftEmail(context),
             preferredProvider
         );
@@ -162,7 +125,7 @@ export class AIService {
         pageContent?: string,
         preferredProvider?: string
     ): Promise<{ data: CompanyResearch; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.researchCompany(companyName, pageContent),
             preferredProvider
         );
@@ -176,7 +139,7 @@ export class AIService {
         text: string,
         preferredProvider?: string
     ): Promise<{ data: ParsedJobDescription; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.parseJobDescription(text),
             preferredProvider
         );
@@ -187,7 +150,7 @@ export class AIService {
         rawText: string,
         preferredProvider?: string
     ): Promise<{ data: ParsedProfile; provider: string }> {
-        const { result, provider } = await this.executeWithFallback(
+        const { result, provider } = await this.execute(
             (p) => p.parseProfile(rawText),
             preferredProvider
         );
@@ -195,31 +158,25 @@ export class AIService {
     }
 }
 
-// Singleton instance - configured via environment or API
+// Environment-only configuration. No runtime HTTP credential mutation is supported.
 let aiServiceInstance: AIService | null = null;
 
 export function getAIService(): AIService {
     if (!aiServiceInstance) {
-        aiServiceInstance = new AIService({
-            groq: {
-                apiKey: process.env.GROQ_API_KEY || '',
-                model: process.env.GROQ_MODEL,
-            },
-            claude: {
-                apiKey: process.env.CLAUDE_API_KEY || '',
-                model: process.env.CLAUDE_MODEL,
-            },
-            gemini: {
-                apiKey: process.env.GEMINI_API_KEY || '',
-                model: process.env.GEMINI_MODEL,
-            },
-            defaultProvider: (process.env.DEFAULT_AI_PROVIDER as 'groq' | 'claude' | 'gemini') || 'groq',
-        });
+        const enabled = process.env.POKI_ENABLE_AI === 'true';
+        const selected = process.env.DEFAULT_AI_PROVIDER;
+        const config: AIServiceConfig = {};
+        if (enabled && selected === 'groq' && process.env.GROQ_API_KEY) {
+            config.groq = { apiKey: process.env.GROQ_API_KEY, model: process.env.GROQ_MODEL };
+            config.defaultProvider = 'groq';
+        } else if (enabled && selected === 'claude' && process.env.CLAUDE_API_KEY) {
+            config.claude = { apiKey: process.env.CLAUDE_API_KEY, model: process.env.CLAUDE_MODEL };
+            config.defaultProvider = 'claude';
+        } else if (enabled && selected === 'gemini' && process.env.GEMINI_API_KEY) {
+            config.gemini = { apiKey: process.env.GEMINI_API_KEY, model: process.env.GEMINI_MODEL };
+            config.defaultProvider = 'gemini';
+        }
+        aiServiceInstance = new AIService(config);
     }
-    return aiServiceInstance;
-}
-
-export function configureAIService(config: AIServiceConfig): AIService {
-    aiServiceInstance = new AIService(config);
     return aiServiceInstance;
 }

@@ -4,6 +4,7 @@
 
 import type { AIProvider, JobDetails, ResumeAnalysis, EmailDraftContext, EmailDraft, CompanyResearch, ParsedJobDescription, ParsedProfile } from '../types.js';
 import { PROMPTS, parseAIJson } from '../prompts.js';
+import { requestAIJson, validateKey, validateModel } from './request.js';
 
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
@@ -13,8 +14,8 @@ export class GeminiProvider implements AIProvider {
     private model: string;
 
     constructor(apiKey: string, model: string = 'gemini-1.5-flash') {
-        this.apiKey = apiKey;
-        this.model = model;
+        this.apiKey = validateKey(apiKey);
+        this.model = validateModel(model);
     }
 
     isConfigured(): boolean {
@@ -22,42 +23,16 @@ export class GeminiProvider implements AIProvider {
     }
 
     private async callAPI(prompt: string): Promise<string> {
-        const url = `${GEMINI_API_URL}/${this.model}:generateContent?key=${this.apiKey}`;
-
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                contents: [
-                    {
-                        parts: [
-                            { text: prompt }
-                        ]
-                    }
-                ],
-                generationConfig: {
-                    temperature: 0.7,
-                    maxOutputTokens: 4096,
-                }
-            }),
-        });
-
-        if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Gemini API error: ${response.status} - ${error}`);
-        }
-
-        const data = await response.json() as {
-            candidates: Array<{
-                content: {
-                    parts: Array<{ text: string }>
-                }
-            }>
-        };
-
-        return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const url = `${GEMINI_API_URL}/${this.model}:generateContent`;
+        const data = await requestAIJson<{
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+        }>(url, { 'x-goog-api-key': this.apiKey }, {
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.7, maxOutputTokens: 4096 },
+        }, prompt);
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (typeof text !== 'string') throw new Error('AI provider returned an invalid response');
+        return text;
     }
 
     async generateText(prompt: string): Promise<string> {

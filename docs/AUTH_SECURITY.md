@@ -1,0 +1,21 @@
+# Phase 0 application authentication
+
+HTTP APIs no longer accept an unverified browser identity. `/api/auth/login` checks a locally configured owner passphrase, `/api/auth/session` verifies an opaque server session, and `/api/auth/logout` revokes it. Every other `/api/*` route, including reads, deletions and provider operations, requires that session even if the business router is mounted separately.
+
+The bootstrap passphrase has no default, is never persisted by the application, and must contain 32–1024 characters. Never put one in Git, screenshots or reports. It is a local single-owner bridge, not a public account-registration or multi-user authentication system. Sign-in is disabled when configuration is absent. Synthetic test fixtures are deliberately recognizable and do not authenticate any deployed service.
+
+Sessions use 256 random bits, store only SHA-256 token digests server-side, expire after eight hours, rotate on login, revoke on logout and disappear when the process restarts. Cookie attributes are HttpOnly, SameSite=Strict, Path=/api, with Secure on HTTPS. HTTP is supported only for loopback local development. Login attempts are capped at five per source address per 15 minutes; both the session store and attempt map have finite capacities. Forwarded client addresses are not trusted. All requests additionally have a per-source 120/minute budget, eight concurrent operations and a finite 1024-source map; asynchronous work remains counted through completion even after a client disconnects. The listener caps concurrent connections at 128.
+
+Origin checks reject foreign origins on reads and writes. Mutation requests, including login/logout, require the exact configured APP_ORIGIN; absence of Origin is rejected. CORS permits only that origin and only needed methods/headers. `Sec-Fetch-Site: cross-site` is rejected. Host allowlisting and loopback listener restrictions reduce DNS-rebinding exposure. Browser API calls use the same origin and reject redirects. Configure UI and API consistently: default UI `http://127.0.0.1:8080`, API listener `127.0.0.1:3002`. These controls are exercised by synthetic Supertest HTTP requests.
+
+Credentials for AI cannot be configured over HTTP. `/api/config` returns 403 in every environment. AI is disabled unless explicitly enabled server-side, and no provider is contacted during this audit. Runtime files use the same explicit SAFE_DATA_DIR confinement as MCP file tools; no cwd fallback or automatic existing-data migration exists. Local queue mutations are serialized within one process, with strict input and size limits. File updates publish synced private siblings atomically, so concurrent readers receive complete versions.
+
+## Later Sign in with ChatGPT integration boundary
+
+A future backend authorization-code callback must verify state, one-time nonce, PKCE, the ID-token signature against trusted OpenAI JWKS, exact issuer, issued client-ID audience and token expiry. Only then map `(issuer, client_id, sub)` to a local account and issue this application's session. ChatGPT plan access is a separate granted scope; do not mistake identity for inference permission. Keep access/refresh tokens in protected backend storage and never return them to browser JavaScript.
+
+Official contract inspected 2026-10-07: [OpenAI OSS registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions). This branch implements the local session foundation only; no OAuth registration, user authorization or entitlement test has occurred.
+
+## Limitations and admission gate
+
+The supported runtime is one local owner and one Linux process. Sessions are memory-only, data storage remains bounded local files and UI preferences/demo data remain in browser storage. Persistent multi-user isolation, durable atomic database transactions, protected OAuth-token storage and real identity-provider integration belong to later work. No claims of production suitability or readiness for real CV/LinkedIn data are made. Tests and independent review must finish before Phase 0 is accepted. Do not deploy or merge this branch without explicit approval.

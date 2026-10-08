@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    target-branch: security/phase-0-hardening
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: security/phase-0-hardening
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

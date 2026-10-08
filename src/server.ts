@@ -6,8 +6,8 @@ import {
 import { registerTools } from './tools.js';
 
 // Configuration from environment
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const HOST = process.env.HOST || 'localhost';
+const PORT = parseInt(process.env.PORT || '3002', 10);
+const HOST = process.env.HOST || '127.0.0.1';
 
 /**
  * Create and configure the MCP server
@@ -53,7 +53,8 @@ export function createServer(): Server {
                         text: `letsmcp MCP Server v2.0.0
 Running on: ${HOST}:${PORT}
 Capabilities: Tools, Resources
-Available Tools: echoText, summarizeDirectory, saveToFile, readFile, searchFiles, executeCommand, webFetch, scrapeLinkedInJob
+Available Tools: echoText, summarizeDirectory, saveToFile, readFile, searchFiles, webFetch
+Filesystem: explicit SAFE_DATA_DIR required; command execution and browser scraping disabled
 Available Resources: server://info`,
                     },
                 ],

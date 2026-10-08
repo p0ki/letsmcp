@@ -1,14 +1,9 @@
 {
-    "mcpServers": {
-        "letsmcp": {
-            "command": "node",
-            "args": [
-                "c:/Users/shane/Downloads/getwork/mcp/dist/index.js"
-            ],
-            "env": {
-                "PORT": "3000",
-                "HOST": "localhost"
-            }
-        }
+  "mcpServers": {
+    "poki-letsmcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/letsmcp/dist/index.js"],
+      "env": {"HOST": "127.0.0.1", "PORT": "3002", "SAFE_DATA_DIR": "/absolute/path/to/private-synthetic-data", "POKI_ENABLE_AI": "false"}
     }
+  }
 }

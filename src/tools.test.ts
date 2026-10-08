@@ -1,535 +1,121 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { registerTools } from './tools.js';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { createServer } from './server.js';
+import { sandboxReadText, sandboxWriteText } from './security/filesystem.js';
 
-describe('MCP Tools', () => {
-    let server: Server;
-
-    beforeEach(() => {
-        server = new Server(
-            { name: 'test-server', version: '1.0.0' },
-            { capabilities: { tools: {} } }
-        );
-        registerTools(server);
+describe('Phase 0 MCP dispatch', () => {
+    let root: string, previous: string | undefined;
+    let server: ReturnType<typeof createServer>;
+    beforeEach(async () => {
+        previous = process.env.SAFE_DATA_DIR;
+        root = await fs.mkdtemp(path.join(os.tmpdir(), 'letsmcp-tools-test-'));
+        process.env.SAFE_DATA_DIR = root;
+        server = createServer();
     });
-
-    describe('echoText', () => {
-        describe('valid inputs', () => {
-            it('should echo simple text', async () => {
-                const result = await callTool('echoText', { text: 'Hello, World!' });
-
-                expect(result.isError).toBeUndefined();
-                expect(result.content).toHaveLength(1);
-                expect(result.content[0].type).toBe('text');
-
-                const response = JSON.parse(result.content[0].text);
-                expect(response).toEqual({ echoed: 'Hello, World!' });
-            });
-
-            it('should echo text with special characters', async () => {
-                const result = await callTool('echoText', { text: 'Test @#$% 123 🚀' });
-
-                const response = JSON.parse(result.content[0].text);
-                expect(response).toEqual({ echoed: 'Test @#$% 123 🚀' });
-            });
-
-            it('should echo multiline text', async () => {
-                const multilineText = 'Line 1\nLine 2\nLine 3';
-                const result = await callTool('echoText', { text: multilineText });
-
-                const response = JSON.parse(result.content[0].text);
-                expect(response).toEqual({ echoed: multilineText });
-            });
-
-            it('should echo very long text', async () => {
-                const longText = 'a'.repeat(10000);
-                const result = await callTool('echoText', { text: longText });
-
-                const response = JSON.parse(result.content[0].text);
-                expect(response).toEqual({ echoed: longText });
-            });
-        });
-
-        describe('error cases', () => {
-            it('should return error for empty string', async () => {
-                const result = await callTool('echoText', { text: '' });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('empty text');
-            });
-
-            it('should return error for whitespace-only string', async () => {
-                const result = await callTool('echoText', { text: '   ' });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('empty text');
-            });
-
-            it('should return error for tabs and newlines only', async () => {
-                const result = await callTool('echoText', { text: '\t\n\r' });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('empty text');
-            });
-
-            it('should return error for missing text parameter', async () => {
-                const result = await callTool('echoText', {});
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('Invalid input');
-            });
-
-            it('should return error for non-string text parameter', async () => {
-                const result = await callTool('echoText', { text: 123 as any });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('Invalid input');
-            });
-        });
+    afterEach(async () => {
+        if (previous === undefined) delete process.env.SAFE_DATA_DIR; else process.env.SAFE_DATA_DIR = previous;
+        await fs.rm(root, { recursive: true, force: true });
+        await server.close();
     });
-
-    describe('summarizeDirectory', () => {
-        const testDir = path.join(process.cwd(), 'test-temp-dir');
-
-        beforeEach(async () => {
-            // Create test directory structure
-            await fs.mkdir(testDir, { recursive: true });
-            await fs.mkdir(path.join(testDir, 'subdir1'), { recursive: true });
-            await fs.mkdir(path.join(testDir, 'subdir2'), { recursive: true });
-            await fs.writeFile(path.join(testDir, 'file1.txt'), 'content1');
-            await fs.writeFile(path.join(testDir, 'file2.txt'), 'content2');
-            await fs.writeFile(path.join(testDir, 'file3.md'), 'content3');
-        });
-
-        afterEach(async () => {
-            // Clean up test directory
-            try {
-                await fs.rm(testDir, { recursive: true, force: true });
-            } catch (error) {
-                // Ignore cleanup errors
-            }
-        });
-
-        describe('valid inputs', () => {
-            it('should summarize directory with files and subdirectories', async () => {
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir' });
-
-                expect(result.isError).toBeUndefined();
-                expect(result.content).toHaveLength(1);
-                expect(result.content[0].type).toBe('text');
-
-                const text = result.content[0].text;
-                expect(text).toContain('test-temp-dir');
-                expect(text).toContain('3 files');
-                expect(text).toContain('2 directories');
-                expect(text).toContain('5 total');
-            });
-
-            it('should show example file names', async () => {
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('Example files:');
-                expect(text).toMatch(/file1\.txt|file2\.txt|file3\.md/);
-            });
-
-            it('should show example directory names', async () => {
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('Example directories:');
-                expect(text).toMatch(/subdir1|subdir2/);
-            });
-
-            it('should use emojis for files and directories', async () => {
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('📄'); // file emoji
-                expect(text).toContain('📁'); // directory emoji
-            });
-
-            it('should handle relative paths', async () => {
-                const result = await callTool('summarizeDirectory', { path: './test-temp-dir' });
-
-                expect(result.isError).toBeUndefined();
-                expect(result.content[0].text).toContain('test-temp-dir');
-            });
-
-            it('should handle current directory', async () => {
-                const result = await callTool('summarizeDirectory', { path: '.' });
-
-                expect(result.isError).toBeUndefined();
-                expect(result.content[0].text).toContain('.');
-            });
-        });
-
-        describe('item limit', () => {
-            it('should limit output to 20 items', async () => {
-                // Create directory with more than 20 items
-                const manyItemsDir = path.join(testDir, 'many-items');
-                await fs.mkdir(manyItemsDir, { recursive: true });
-
-                for (let i = 0; i < 30; i++) {
-                    await fs.writeFile(path.join(manyItemsDir, `file${i}.txt`), `content${i}`);
-                }
-
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir/many-items' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('30 total');
-                expect(text).toContain('Showing first 20 of 30 items');
-
-                // Count emoji occurrences (should be 20)
-                const emojiCount = (text.match(/📄/g) || []).length;
-                expect(emojiCount).toBe(20);
-            });
-        });
-
-        describe('error cases', () => {
-            it('should return error for non-existent directory', async () => {
-                const result = await callTool('summarizeDirectory', { path: 'non-existent-dir-xyz' });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain("doesn't seem to exist");
-            });
-
-            it('should return error for empty path', async () => {
-                const result = await callTool('summarizeDirectory', { path: '' });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('Invalid input');
-            });
-
-            it('should return error for missing path parameter', async () => {
-                const result = await callTool('summarizeDirectory', {});
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('Invalid input');
-            });
-
-            it('should return error for non-string path parameter', async () => {
-                const result = await callTool('summarizeDirectory', { path: 123 as any });
-
-                expect(result.isError).toBe(true);
-                expect(result.content[0].text).toContain('Invalid input');
-            });
-
-            it('should handle permission errors gracefully', async () => {
-                // This test is platform-dependent and may not work on all systems
-                // On Windows, we can't easily create a directory without read permissions
-                // So we'll just verify the error handling structure exists
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir' });
-                expect(result.content).toBeDefined();
-            });
-        });
-
-        describe('edge cases', () => {
-            it('should handle empty directory', async () => {
-                const emptyDir = path.join(testDir, 'empty');
-                await fs.mkdir(emptyDir, { recursive: true });
-
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir/empty' });
-
-                expect(result.isError).toBeUndefined();
-                const text = result.content[0].text;
-                expect(text).toContain('0 files');
-                expect(text).toContain('0 directories');
-            });
-
-            it('should handle directory with only files', async () => {
-                const filesOnlyDir = path.join(testDir, 'files-only');
-                await fs.mkdir(filesOnlyDir, { recursive: true });
-                await fs.writeFile(path.join(filesOnlyDir, 'file1.txt'), 'content');
-                await fs.writeFile(path.join(filesOnlyDir, 'file2.txt'), 'content');
-
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir/files-only' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('2 files');
-                expect(text).toContain('0 directories');
-            });
-
-            it('should handle directory with only subdirectories', async () => {
-                const dirsOnlyDir = path.join(testDir, 'dirs-only');
-                await fs.mkdir(dirsOnlyDir, { recursive: true });
-                await fs.mkdir(path.join(dirsOnlyDir, 'sub1'), { recursive: true });
-                await fs.mkdir(path.join(dirsOnlyDir, 'sub2'), { recursive: true });
-
-                const result = await callTool('summarizeDirectory', { path: 'test-temp-dir/dirs-only' });
-
-                const text = result.content[0].text;
-                expect(text).toContain('0 files');
-                expect(text).toContain('2 directories');
-            });
-        });
-    });
-
-    describe('saveToFile', () => {
-        const testFilesDir = path.join(process.cwd(), 'mcp-files');
-
-        afterEach(async () => {
-            // Clean up test files
-            try {
-                await fs.rm(testFilesDir, { recursive: true, force: true });
-            } catch (error) {
-                // Ignore cleanup errors
-            }
-        });
-
-        it('should save file successfully', async () => {
-            const result = await callTool('saveToFile', {
-                content: 'Test content',
-                filename: 'test.txt'
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.success).toBe(true);
-            expect(response.path).toContain('test.txt');
-
-            // Verify file was created
-            const content = await fs.readFile(response.path, 'utf-8');
-            expect(content).toBe('Test content');
-        });
-
-        it('should save file with category', async () => {
-            const result = await callTool('saveToFile', {
-                content: 'Cover letter content',
-                filename: 'cover-letter.txt',
-                category: 'applications/google'
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.path).toContain('applications');
-            expect(response.path).toContain('google');
-            expect(response.path).toContain('cover-letter.txt');
-        });
-
-        it('should prevent overwriting without permission', async () => {
-            // Create file first
-            await callTool('saveToFile', {
-                content: 'Original',
-                filename: 'test.txt'
-            });
-
-            // Try to overwrite
-            const result = await callTool('saveToFile', {
-                content: 'New content',
-                filename: 'test.txt'
-            });
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0].text).toContain('already exists');
-        });
-
-        it('should allow overwriting with permission', async () => {
-            // Create file first
-            await callTool('saveToFile', {
-                content: 'Original',
-                filename: 'test.txt'
-            });
-
-            // Overwrite with permission
-            const result = await callTool('saveToFile', {
-                content: 'New content',
-                filename: 'test.txt',
-                overwrite: true
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-
-            // Verify content was updated
-            const content = await fs.readFile(response.path, 'utf-8');
-            expect(content).toBe('New content');
-        });
-    });
-
-    describe('readFile', () => {
-        const testFilesDir = path.join(process.cwd(), 'test-read-files');
-
-        beforeEach(async () => {
-            await fs.mkdir(testFilesDir, { recursive: true });
-            await fs.writeFile(path.join(testFilesDir, 'test.txt'), 'Test content');
-        });
-
-        afterEach(async () => {
-            try {
-                await fs.rm(testFilesDir, { recursive: true, force: true });
-            } catch (error) {
-                // Ignore cleanup errors
-            }
-        });
-
-        it('should read file successfully', async () => {
-            const result = await callTool('readFile', {
-                path: 'test-read-files/test.txt'
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.content).toBe('Test content');
-            expect(response.metadata.encoding).toBe('utf-8');
-        });
-
-        it('should return error for non-existent file', async () => {
-            const result = await callTool('readFile', {
-                path: 'non-existent.txt'
-            });
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0].text).toContain('Error reading file');
-        });
-
-        it('should return error for directory', async () => {
-            const result = await callTool('readFile', {
-                path: 'test-read-files'
-            });
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0].text).toContain('not a file');
-        });
-    });
-
-    describe('searchFiles', () => {
-        const testSearchDir = path.join(process.cwd(), 'test-search-dir');
-
-        beforeEach(async () => {
-            await fs.mkdir(testSearchDir, { recursive: true });
-            await fs.writeFile(path.join(testSearchDir, 'file1.txt'), 'Python is great\nJavaScript too');
-            await fs.writeFile(path.join(testSearchDir, 'file2.md'), 'I love Python programming');
-            await fs.writeFile(path.join(testSearchDir, 'file3.txt'), 'No matches here');
-        });
-
-        afterEach(async () => {
-            try {
-                await fs.rm(testSearchDir, { recursive: true, force: true });
-            } catch (error) {
-                // Ignore cleanup errors
-            }
-        });
-
-        it('should find matches in files', async () => {
-            const result = await callTool('searchFiles', {
-                query: 'Python',
-                path: 'test-search-dir'
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.totalMatches).toBeGreaterThan(0);
-            expect(response.matches.some((m: any) => m.content.includes('Python'))).toBe(true);
-        });
-
-        it('should filter by file type', async () => {
-            const result = await callTool('searchFiles', {
-                query: 'Python',
-                path: 'test-search-dir',
-                fileTypes: ['txt']
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.matches.every((m: any) => m.file.endsWith('.txt'))).toBe(true);
-        });
-
-        it('should respect maxResults', async () => {
-            const result = await callTool('searchFiles', {
-                query: 'Python',
-                path: 'test-search-dir',
-                maxResults: 1
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.matches.length).toBeLessThanOrEqual(1);
-        });
-    });
-
-    describe('executeCommand', () => {
-        it('should execute simple command', async () => {
-            // Use node command which works cross-platform
-            const result = await callTool('executeCommand', {
-                command: 'node',
-                args: ['--version']
-            });
-
-            const response = JSON.parse(result.content[0].text);
-            expect(response.exitCode).toBe(0);
-            expect(response.stdout).toContain('v');
-        });
-
-        it('should handle command errors', async () => {
-            const result = await callTool('executeCommand', {
-                command: 'nonexistentcommand123'
-            });
-
-            expect(result.isError).toBe(true);
-        });
-
-        it('should return exit code for failed commands', async () => {
-            // Use a cross-platform approach: bash on Linux/Mac, cmd on Windows
-            const isWindows = process.platform === 'win32';
-            const result = await callTool('executeCommand', isWindows ? {
-                command: 'cmd',
-                args: ['/c', 'exit 1']
-            } : {
-                command: 'bash',
-                args: ['-c', 'exit 1']
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.exitCode).toBe(1);
-        });
-    });
-
-    describe('webFetch', () => {
-        it('should fetch web content', async () => {
-            const result = await callTool('webFetch', {
-                url: 'https://example.com'
-            });
-
-            expect(result.isError).toBeUndefined();
-            const response = JSON.parse(result.content[0].text);
-            expect(response.metadata.statusCode).toBe(200);
-            expect(response.content).toContain('Example Domain');
-        });
-
-        it('should handle invalid URLs', async () => {
-            const result = await callTool('webFetch', {
-                url: 'not-a-url'
-            });
-
-            expect(result.isError).toBe(true);
-        });
-
-        it('should handle 404 errors', async () => {
-            const result = await callTool('webFetch', {
-                url: 'https://example.com/nonexistent-page-12345'
-            });
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0].text).toContain('404');
-        });
-    });
-
-    // Helper function to call tools
-    async function callTool(name: string, args: any) {
+    const call = async (name: string, args?: unknown) => (server as any)._requestHandlers.get('tools/call')({ method: 'tools/call', params: { name, arguments: args } });
+    it('advertises only safe tools', async () => {
         const handlers = (server as any)._requestHandlers;
-        const callHandler = handlers.get('tools/call');
-
-        if (!callHandler) {
-            throw new Error('Tool call handler not registered');
-        }
-
-        return await callHandler({
-            method: 'tools/call',
-            params: { name, arguments: args }
-        });
-    }
+        const listed = await handlers.get('tools/list')({ method: 'tools/list' });
+        expect(listed.tools.map((tool: any) => tool.name)).toEqual(['echoText', 'summarizeDirectory', 'saveToFile', 'readFile', 'searchFiles', 'webFetch']);
+        const info = await handlers.get('resources/read')({ method: 'resources/read', params: { uri: 'server://info' } });
+        expect(info.contents[0].text).not.toContain('executeCommand');
+        expect(info.contents[0].text).not.toContain('scrapeLinkedInJob');
+    });
+    it.each(['executeCommand', 'scrapeLinkedInJob'])('rejects legacy %s without side effects', async name => {
+        expect((await call(name, { command: 'touch', args: [path.join(root, 'must-not-exist')], url: 'http://127.0.0.1' })).isError).toBe(true);
+        await expect(fs.access(path.join(root, 'must-not-exist'))).rejects.toThrow();
+    });
+    it.each([undefined, { text: 1 }, { text: 'ok', extra: true }])('handles malformed object arguments: %j', async args => expect((await call('echoText', args)).isError).toBe(true));
+    it.each([{ args: null }, { args: [] }, { args: 'wrong' }])('SDK rejects malformed argument records: %j', async ({ args }) => await expect(call('echoText', args)).rejects.toThrow());
+    it('saves, reads and searches literal text', async () => {
+        expect((await call('saveToFile', { filename: 'sample.txt', category: 'notes/demo', content: 'Python\nPython\n(a+)+' })).isError).toBeUndefined();
+        expect(JSON.parse((await call('readFile', { path: 'notes/demo/sample.txt' })).content[0].text).content).toContain('(a+)+');
+        expect(JSON.parse((await call('searchFiles', { path: '.', query: 'Python' })).content[0].text).totalMatches).toBe(2);
+        expect(JSON.parse((await call('searchFiles', { path: '.', query: '(a+)+' })).content[0].text).totalMatches).toBe(1);
+        expect(JSON.parse((await call('summarizeDirectory', { path: 'notes' })).content[0].text).directories).toBe(1);
+    });
+    it('requires explicit SAFE_DATA_DIR', async () => {
+        delete process.env.SAFE_DATA_DIR;
+        for (const [tool, args] of [['readFile', { path: 'package.json' }], ['summarizeDirectory', { path: '.' }], ['searchFiles', { path: '.', query: 'x' }], ['saveToFile', { filename: 'x.txt', content: 'x' }]] as const) expect((await call(tool, args)).isError).toBe(true);
+    });
+    it.each(['../outside.txt', '/etc/passwd', '.env', '.ssh/id_rsa', 'folder/../../etc/passwd'])('blocks escaped or sensitive reads: %s', async input => expect((await call('readFile', { path: input })).isError).toBe(true));
+    it('rejects prefix sibling paths', async () => expect((await call('readFile', { path: root + '-sibling/file.txt' })).isError).toBe(true));
+    it('rejects symlink files, parents and hardlinks without overwriting their target', async () => {
+        const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'letsmcp-outside-test-'));
+        try {
+            const secret = path.join(outside, 'secret.txt');
+            await fs.writeFile(secret, 'fixture-secret');
+            await fs.symlink(secret, path.join(root, 'link.txt'));
+            await fs.symlink(outside, path.join(root, 'linked-dir'));
+            await fs.link(secret, path.join(root, 'hardlink.txt'));
+            for (const input of ['link.txt', 'linked-dir/secret.txt', 'hardlink.txt']) expect((await call('readFile', { path: input })).isError).toBe(true);
+            for (const filename of ['link.txt', 'hardlink.txt']) expect((await call('saveToFile', { filename, content: 'attack', overwrite: true })).isError).toBe(true);
+            expect((await call('saveToFile', { filename: 'new.txt', category: 'linked-dir', content: 'attack' })).isError).toBe(true);
+            expect(await fs.readFile(secret, 'utf8')).toBe('fixture-secret');
+            expect((await call('searchFiles', { path: '.', query: 'fixture-secret' })).isError).toBe(true);
+        } finally { await fs.rm(outside, { recursive: true, force: true }); }
+    });
+    it('rejects symlink configuration and roots readable by others', async () => {
+        const linked = root + '-link';
+        await fs.symlink(root, linked);
+        try {
+            process.env.SAFE_DATA_DIR = linked;
+            expect((await call('summarizeDirectory', { path: '.' })).isError).toBe(true);
+            process.env.SAFE_DATA_DIR = root;
+            await fs.chmod(root, 0o755);
+            expect((await call('summarizeDirectory', { path: '.' })).isError).toBe(true);
+        } finally { await fs.unlink(linked); }
+    });
+    it('requires overwrite consent and keeps private file modes', async () => {
+        await call('saveToFile', { filename: 'existing.txt', content: 'first' });
+        expect((await call('saveToFile', { filename: 'existing.txt', content: 'second' })).isError).toBe(true);
+        expect(await fs.readFile(path.join(root, 'existing.txt'), 'utf8')).toBe('first');
+        await fs.chmod(path.join(root, 'existing.txt'), 0o644);
+        expect((await call('saveToFile', { filename: 'existing.txt', content: 'second', overwrite: true })).isError).toBeUndefined();
+        expect((await fs.stat(path.join(root, 'existing.txt'))).mode & 0o777).toBe(0o600);
+    });
+    it('publishes complete old/new versions to concurrent readers', async () => {
+        const versions = [JSON.stringify({ version: 0, text: 'a'.repeat(250_000) }), JSON.stringify({ version: 1, text: 'b'.repeat(250_000) })];
+        await sandboxWriteText('jobs.json', versions[0]);
+        const reader = async () => {
+            for (let index = 0; index < 40; index++) {
+                const observed = await sandboxReadText('jobs.json');
+                expect(versions).toContain(observed);
+                expect(() => JSON.parse(observed)).not.toThrow();
+            }
+        };
+        const writer = async () => {
+            for (let index = 0; index < 20; index++) await sandboxWriteText('jobs.json', versions[index % 2]);
+        };
+        await Promise.all([writer(), reader(), reader()]);
+        expect((await fs.readdir(root)).filter(name => name.startsWith('.poki-write-'))).toEqual([]);
+    });
+    it('no-overwrite races publish only one complete file and remove their own temporaries', async () => {
+        const versions = ['a'.repeat(50_000), 'b'.repeat(50_000)];
+        const writes = await Promise.all(versions.map(content => call('saveToFile', { filename: 'race.txt', content })));
+        expect(writes.filter(value => !value.isError)).toHaveLength(1);
+        expect(versions).toContain(await sandboxReadText('race.txt'));
+        expect((await fs.readdir(root)).filter(name => name.startsWith('.poki-write-'))).toEqual([]);
+    });
+    it.each(['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.git', '.codex', '.agents', '.env.d', 'credentials', 'secrets'])('rejects credential directory ancestors in configured root: %s', async segment => {
+        const credentialRoot = path.join(root, segment, 'nested');
+        await fs.mkdir(credentialRoot, { recursive: true, mode: 0o700 });
+        process.env.SAFE_DATA_DIR = credentialRoot;
+        expect((await call('summarizeDirectory', { path: '.' })).isError).toBe(true);
+    });
+    it('enforces limits even if schema checks are bypassed', async () => {
+        for (const value of [0, -1, NaN, Infinity, 1024 * 1024 + 1]) expect((await call('readFile', { path: 'file.txt', maxSize: value })).isError).toBe(true);
+        expect((await call('saveToFile', { filename: 'large.txt', content: 'x'.repeat(1024 * 1024 + 1) })).isError).toBe(true);
+        expect((await call('searchFiles', { path: '.', query: 'x', maxResults: 1000 })).isError).toBe(true);
+        await fs.writeFile(path.join(root, 'big.txt'), 'x'.repeat(1024 * 1024 + 1));
+        expect((await call('readFile', { path: 'big.txt' })).isError).toBe(true);
+    });
+    it.each(['http://127.0.0.1', 'http://2130706433', 'http://[::ffff:127.0.0.1]', 'http://169.254.169.254/latest/meta-data', 'http://10.0.0.1', 'file:///etc/passwd', 'https://linkedin.com@127.0.0.1/jobs'])('blocks MCP SSRF: %s', async url => expect((await call('webFetch', { url })).isError).toBe(true));
 });

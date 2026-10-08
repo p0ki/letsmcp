@@ -4,6 +4,7 @@
 
 import type { AIProvider, JobDetails, ResumeAnalysis, EmailDraftContext, EmailDraft, CompanyResearch, ParsedJobDescription, ParsedProfile } from '../types.js';
 import { PROMPTS, parseAIJson } from '../prompts.js';
+import { requestAIJson, validateKey, validateModel } from './request.js';
 
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 
@@ -13,8 +14,8 @@ export class ClaudeProvider implements AIProvider {
     private model: string;
 
     constructor(apiKey: string, model: string = 'claude-3-5-sonnet-20241022') {
-        this.apiKey = apiKey;
-        this.model = model;
+        this.apiKey = validateKey(apiKey);
+        this.model = validateModel(model);
     }
 
     isConfigured(): boolean {
@@ -22,33 +23,15 @@ export class ClaudeProvider implements AIProvider {
     }
 
     private async callAPI(prompt: string): Promise<string> {
-        const response = await fetch(CLAUDE_API_URL, {
-            method: 'POST',
-            headers: {
-                'x-api-key': this.apiKey,
-                'anthropic-version': '2023-06-01',
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
+        const data = await requestAIJson<{ content?: Array<{ type: string; text?: string }> }>(
+            CLAUDE_API_URL, { 'x-api-key': this.apiKey, 'anthropic-version': '2023-06-01' }, {
                 model: this.model,
                 max_tokens: 4096,
-                messages: [
-                    {
-                        role: 'user',
-                        content: prompt
-                    }
-                ],
-            }),
-        });
-
-        if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`Claude API error: ${response.status} - ${error}`);
-        }
-
-        const data = await response.json() as { content: Array<{ type: string; text: string }> };
-        const textContent = data.content.find(c => c.type === 'text');
-        return textContent?.text || '';
+                messages: [{ role: 'user', content: prompt }],
+            }, prompt);
+        const text = Array.isArray(data.content) ? data.content.find(c => c && c.type === 'text')?.text : undefined;
+        if (typeof text !== 'string') throw new Error('AI provider returned an invalid response');
+        return text;
     }
 
     async generateText(prompt: string): Promise<string> {

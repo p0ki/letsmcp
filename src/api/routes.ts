@@ -1,641 +1,156 @@
-/**
- * HTTP API Routes for LetsMCP
- * Provides REST endpoints for external applications (like JobOS)
- */
+/** All HTTP business routes require the application's own opaque session. */
+import { randomUUID } from 'node:crypto';
+import { Router, type Request, type Response, type NextFunction } from 'express';
+import { z } from 'zod';
+import { getAIService } from '../ai/service.js';
+import { createAuth } from '../security/auth.js';
+import { trackRequestWork } from '../security/limits.js';
+import { fetchPublicText } from '../security/network.js';
+import { sandboxReadText, sandboxWriteText } from '../security/filesystem.js';
 
-import type { Request, Response, Router } from 'express';
-import { Router as createRouter } from 'express';
-import { getAIService, configureAIService } from '../ai/service.js';
-import type { AIServiceConfig, EmailDraftContext } from '../ai/types.js';
-import { chromium } from 'playwright-extra';
-import stealth from 'puppeteer-extra-plugin-stealth';
-
-chromium.use(stealth());
-import fs from 'fs/promises';
-import path from 'path';
-
-const JOBS_FILE = path.join(process.cwd(), 'jobs.json');
-const RESUME_FILE = path.join(process.cwd(), 'resume.txt');
-const PROFILE_FILE = path.join(process.cwd(), 'profile.json');
-
-export function createAPIRoutes(): Router {
-    const router = createRouter();
-
-    // Middleware to parse JSON
-    router.use((req, res, next) => {
-        if (req.headers['content-type']?.includes('application/json')) {
-            next();
-        } else {
-            next();
-        }
-    });
-
-    /**
-     * GET /api/status
-     * Returns API status and configured providers
-     */
-    router.get('/status', (_req: Request, res: Response) => {
-        const service = getAIService();
-        res.json({
-            status: 'ok',
-            version: '2.0.0',
-            providers: service.getConfiguredProviders(),
-            hasAI: service.hasProvider(),
-        });
-    });
-
-    /**
-     * POST /api/config
-     * Update AI provider configuration at runtime
-     */
-    router.post('/config', (req: Request, res: Response) => {
-        // Runtime reconfiguration is disabled in production: this endpoint
-        // accepts provider credentials, so it must never be exposed publicly.
-        if (process.env.NODE_ENV === 'production') {
-            res.status(403).json({ error: 'Runtime configuration is disabled in production' });
-            return;
-        }
-        try {
-            const config = req.body as AIServiceConfig;
-            const service = configureAIService(config);
-            res.json({
-                success: true,
-                providers: service.getConfiguredProviders(),
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(400).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/generate
-     * Generate text using AI
-     */
-    router.post('/generate', async (req: Request, res: Response) => {
-        try {
-            const { prompt, provider } = req.body as { prompt: string; provider?: string };
-
-            if (!prompt) {
-                res.status(400).json({ error: 'prompt is required' });
-                return;
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.generateText(prompt, provider);
-            res.json({
-                success: true,
-                text: result.text,
-                provider: result.provider,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/extract-job
-     * Extract job details from text or URL
-     */
-    router.post('/extract-job', async (req: Request, res: Response) => {
-        try {
-            const { text, url, provider } = req.body as { text?: string; url?: string; provider?: string };
-
-            if (!text && !url) {
-                res.status(400).json({ error: 'Either text or url is required' });
-                return;
-            }
-
-            let contentToAnalyze = text || '';
-
-            // If URL provided, try to scrape it first
-            if (url) {
-                if (url.includes('linkedin.com/jobs')) {
-                    // Try LinkedIn scraper, but gracefully fall back on failure
-                    try {
-                        const scraped = await scrapeLinkedInJob(url);
-                        if (scraped.title) {
-                            // Return scraped data directly if successful
-                            res.json({
-                                success: true,
-                                data: {
-                                    title: scraped.title,
-                                    company: scraped.company,
-                                    location: scraped.location,
-                                    description: scraped.description,
-                                    source: 'LinkedIn',
-                                },
-                                provider: 'linkedin-scraper',
-                            });
-                            return;
-                        }
-                        // Fall back to AI extraction with scraped description
-                        contentToAnalyze = scraped.description || url;
-                    } catch (scrapeError) {
-                        console.warn('LinkedIn scraper failed:', scrapeError);
-                        // LinkedIn requires login - return helpful error
-                        res.status(400).json({
-                            success: false,
-                            error: 'LinkedIn requires login to view job details. Please copy and paste the full job description text instead of the URL.',
-                            hint: 'Copy the job description from the LinkedIn page and paste it directly.',
-                            url: url,
-                        });
-                        return;
-                    }
-                } else {
-                    // For other URLs, fetch content
-                    try {
-                        const response = await fetch(url);
-                        contentToAnalyze = await response.text();
-                    } catch {
-                        contentToAnalyze = url;
-                    }
-                }
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.extractJobDetails(contentToAnalyze, provider);
-            res.json({
-                success: true,
-                data: result.data,
-                provider: result.provider,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/scrape-linkedin
-     * Scrape a LinkedIn job posting directly
-     */
-    router.post('/scrape-linkedin', async (req: Request, res: Response) => {
-        try {
-            const { url, includeDescription = true, screenshot = false } = req.body as {
-                url: string;
-                includeDescription?: boolean;
-                screenshot?: boolean;
-            };
-
-            if (!url || !url.includes('linkedin.com/jobs')) {
-                res.status(400).json({ error: 'Valid LinkedIn job URL is required' });
-                return;
-            }
-
-            const result = await scrapeLinkedInJob(url, includeDescription, screenshot);
-            res.json({
-                success: true,
-                data: result,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/analyze-resume
-     * Analyze resume against job description
-     */
-    router.post('/analyze-resume', async (req: Request, res: Response) => {
-        try {
-            const { jobDescription, resumeText, provider } = req.body as {
-                jobDescription: string;
-                resumeText: string;
-                provider?: string;
-            };
-
-            if (!jobDescription || !resumeText) {
-                res.status(400).json({ error: 'jobDescription and resumeText are required' });
-                return;
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.analyzeResume(jobDescription, resumeText, provider);
-            res.json({
-                success: true,
-                data: result.data,
-                provider: result.provider,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/draft-email
-     * Draft an outreach email
-     */
-    router.post('/draft-email', async (req: Request, res: Response) => {
-        try {
-            const context = req.body as EmailDraftContext & { provider?: string };
-
-            if (!context.recipientName || !context.companyName || !context.jobTitle) {
-                res.status(400).json({ error: 'recipientName, companyName, and jobTitle are required' });
-                return;
-            }
-
-            // Set defaults
-            context.tone = context.tone || 'Professional';
-            context.intent = context.intent || 'Connect';
-            context.recipientRole = context.recipientRole || 'Team Member';
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.draftEmail(context, context.provider);
-            res.json({
-                success: true,
-                data: result.data,
-                provider: result.provider,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * GET /api/resume
-     * Retrieve stored master resume text
-     */
-    router.get('/resume', async (_req: Request, res: Response) => {
-        try {
-            let text = '';
-            try {
-                text = await fs.readFile(RESUME_FILE, 'utf-8');
-            } catch {
-                // File doesn't exist yet
-            }
-            res.json({ success: true, text, hasResume: text.length > 0 });
-        } catch (error) {
-            res.status(500).json({ error: 'Failed to read resume' });
-        }
-    });
-
-    /**
-     * POST /api/resume
-     * Save master resume text
-     */
-    router.post('/resume', async (req: Request, res: Response) => {
-        try {
-            const { text } = req.body as { text: string };
-            if (typeof text !== 'string') {
-                res.status(400).json({ error: 'text (string) is required' });
-                return;
-            }
-            await fs.writeFile(RESUME_FILE, text, 'utf-8');
-            res.json({ success: true, message: 'Resume saved', length: text.length });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/research
-     * Research a company using AI (with optional web fetch for their URL)
-     */
-    router.post('/research', async (req: Request, res: Response) => {
-        try {
-            const { companyName, url, provider } = req.body as {
-                companyName: string;
-                url?: string;
-                provider?: string;
-            };
-
-            if (!companyName) {
-                res.status(400).json({ error: 'companyName is required' });
-                return;
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            // Try to fetch company website content if URL provided
-            let pageContent: string | undefined;
-            if (url) {
-                try {
-                    const fetchRes = await fetch(url, {
-                        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JobResearcher/1.0)' },
-                        signal: AbortSignal.timeout(8000),
-                    });
-                    if (fetchRes.ok) {
-                        const html = await fetchRes.text();
-                        // Strip HTML tags for cleaner AI input
-                        pageContent = html
-                            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-                            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-                            .replace(/<[^>]+>/g, ' ')
-                            .replace(/\s+/g, ' ')
-                            .trim();
-                    }
-                } catch {
-                    // Continue without page content
-                }
-            }
-
-            const result = await service.researchCompany(companyName, pageContent, provider);
-            res.json({
-                success: true,
-                data: result.data,
-                provider: result.provider,
-                fetchedUrl: url && pageContent ? url : null,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/parse-jd
-     * Parse a job description into structured skill/requirement data
-     */
-    router.post('/parse-jd', async (req: Request, res: Response) => {
-        try {
-            const { description, provider } = req.body as { description: string; provider?: string };
-
-            if (!description) {
-                res.status(400).json({ error: 'description is required' });
-                return;
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.parseJobDescription(description, provider);
-            res.json({
-                success: true,
-                data: result.data,
-                provider: result.provider,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * GET /api/profile
-     * Return the stored LinkedIn profile (if any)
-     */
-    router.get('/profile', async (req: Request, res: Response) => {
-        try {
-            const data = await fs.readFile(PROFILE_FILE, 'utf-8');
-            res.json({ success: true, profile: JSON.parse(data) });
-        } catch {
-            res.json({ success: false, profile: null });
-        }
-    });
-
-    /**
-     * POST /api/profile
-     * Receive raw profile text from extension, AI-parse it, and store
-     */
-    router.post('/profile', async (req: Request, res: Response) => {
-        try {
-            const { rawText, provider } = req.body as { rawText: string; provider?: string };
-            if (!rawText) {
-                res.status(400).json({ error: 'rawText is required' });
-                return;
-            }
-
-            const service = getAIService();
-            if (!service.hasProvider()) {
-                res.status(503).json({ error: 'No AI providers configured' });
-                return;
-            }
-
-            const result = await service.parseProfile(rawText, provider);
-            await fs.writeFile(PROFILE_FILE, JSON.stringify(result.data, null, 2), 'utf-8');
-            res.json({ success: true, profile: result.data, provider: result.provider });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * POST /api/jobs
-     * Receive job from extension and save to queue
-     */
-    router.post('/jobs', async (req: Request, res: Response) => {
-        try {
-            const jobData = req.body;
-            if (!jobData || !jobData.title) {
-                res.status(400).json({ error: 'Invalid job data' });
-                return;
-            }
-
-            let jobs = [];
-            try {
-                const data = await fs.readFile(JOBS_FILE, 'utf-8');
-                jobs = JSON.parse(data);
-            } catch (e) {
-                // File doesn't exist or invalid, start fresh
-                jobs = [];
-            }
-
-            // Check for duplicate (by URL or Title+Company)
-            const exists = jobs.some((j: any) => {
-                if (j.url && jobData.url && j.url === jobData.url) return true;
-                if (j.title === jobData.title && j.company === jobData.company) return true;
-                return false;
-            });
-
-            if (exists) {
-                res.json({ success: true, message: 'Job already queued', isDuplicate: true });
-                return;
-            }
-
-            // Generate ID if not present
-            if (!jobData.id) {
-                jobData.id = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            }
-
-            jobs.push(jobData);
-            await fs.writeFile(JOBS_FILE, JSON.stringify(jobs, null, 2));
-
-            res.json({ success: true, message: 'Job saved to queue' });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            res.status(500).json({ error: message });
-        }
-    });
-
-    /**
-     * GET /api/jobs
-     * Retrieve queued jobs
-     */
-    router.get('/jobs', async (_req: Request, res: Response) => {
-        try {
-            let jobs = [];
-            try {
-                const data = await fs.readFile(JOBS_FILE, 'utf-8');
-                jobs = JSON.parse(data);
-            } catch {
-                jobs = [];
-            }
-            res.json({ success: true, count: jobs.length, data: jobs });
-        } catch (error) {
-            res.status(500).json({ error: 'Failed to read jobs' });
-        }
-    });
-
-    /**
-     * DELETE /api/jobs/:id
-     * Delete a specific job from the queue
-     */
-    router.delete('/jobs/:id', async (req: Request, res: Response) => {
-        try {
-            const { id } = req.params;
-            let jobs = [];
-            try {
-                const data = await fs.readFile(JOBS_FILE, 'utf-8');
-                jobs = JSON.parse(data);
-            } catch {
-                jobs = [];
-            }
-
-            const filteredJobs = jobs.filter((j: any) => j.id !== id);
-            await fs.writeFile(JOBS_FILE, JSON.stringify(filteredJobs, null, 2));
-            res.json({ success: true, message: 'Job deleted' });
-        } catch (error) {
-            res.status(500).json({ error: 'Failed to delete job' });
-        }
-    });
-
-    /**
-     * DELETE /api/jobs
-     * Clear job queue
-     */
-    router.delete('/jobs', async (_req: Request, res: Response) => {
-        try {
-            await fs.writeFile(JOBS_FILE, '[]');
-            res.json({ success: true, message: 'Job queue cleared' });
-        } catch (error) {
-            res.status(500).json({ error: 'Failed to clear jobs' });
-        }
-    });
-
-    return router;
+const text = z.string().min(1).max(200_000);
+const short = z.string().min(1).max(1000);
+const provider = z.enum(['groq', 'claude', 'gemini']).optional();
+const url = z.string().max(4096).url();
+const jobSchema = z.object({
+    id: z.string().max(128).optional(), title: short, company: z.string().max(1000).default(''),
+    location: z.string().max(1000).default(''), description: z.string().max(200_000).default(''),
+    url: url.optional(), originalLink: url.optional(), source: z.string().max(100).optional(),
+    isRemote: z.boolean().optional(), dateAdded: z.string().max(64).optional(),
+    scrapedAt: z.string().max(64).optional(), salaryRange: z.string().max(1000).optional(),
+});
+type QueuedJob = z.infer<typeof jobSchema>;
+// Serialize local mutations. Phase 0 is one owner/one process; no multi-user claims.
+let writeQueue: Promise<unknown> = Promise.resolve();
+function serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = writeQueue.then(operation);
+    writeQueue = result.catch(() => undefined);
+    return result;
 }
-
-/**
- * LinkedIn job scraper helper
- */
-async function scrapeLinkedInJob(
-    url: string,
-    includeDescription: boolean = true,
-    screenshot: boolean = false
-): Promise<{
-    title: string;
-    company: string;
-    location: string;
-    description: string;
-    postedDate: string;
-    url: string;
-    scrapedAt: string;
-    screenshot?: string;
-}> {
-    let browser;
-    try {
-        // Extract job ID from various URL formats and normalize to view URL
-        let normalizedUrl = url;
-        const jobIdMatch = url.match(/(?:currentJobId=|\/view\/)(\d+)/);
-        if (jobIdMatch) {
-            normalizedUrl = `https://www.linkedin.com/jobs/view/${jobIdMatch[1]}`;
-        }
-
-        browser = await chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process',
-            ],
-        });
-        const page = await browser.newPage();
-
-        // Set a realistic user agent
-        await page.setExtraHTTPHeaders({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        });
-
-        await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Wait a bit for JS to render
-        await page.waitForTimeout(2000);
-
-        // Wait for any job title selector (multiple possible layouts)
-        await page.waitForSelector('.top-card-layout__title, .job-details-jobs-unified-top-card__job-title, h1.t-24, h2.t-24, .jobs-unified-top-card__job-title', { timeout: 15000 });
-
-        const jobData = await page.evaluate((includeDesc) => {
-            const getText = (selector: string): string => {
-                // eslint-disable-next-line no-undef
-                const el = document.querySelector(selector);
-                return el?.textContent?.trim() || '';
-            };
-
-            // Try multiple selectors for each field
-            return {
-                title: getText('.top-card-layout__title') || getText('.job-details-jobs-unified-top-card__job-title') || getText('.jobs-unified-top-card__job-title') || getText('h1.t-24') || getText('h2.t-24'),
-                company: getText('.top-card-layout__first-subline a') || getText('.job-details-jobs-unified-top-card__company-name') || getText('.jobs-unified-top-card__company-name') || getText('.topcard__org-name-link'),
-                location: getText('.top-card-layout__second-subline span') || getText('.job-details-jobs-unified-top-card__bullet') || getText('.jobs-unified-top-card__bullet') || getText('.topcard__flavor--bullet'),
-                description: includeDesc ? (getText('.show-more-less-html__markup') || getText('.jobs-description__content') || getText('.description__text')) : '',
-                postedDate: getText('.posted-time-ago__text') || getText('.job-details-jobs-unified-top-card__posted-date') || getText('.jobs-unified-top-card__posted-date'),
-            };
-        }, includeDescription);
-
-        let screenshotPath: string | undefined;
-        if (screenshot) {
-            const fs = await import('fs/promises');
-            const path = await import('path');
-            screenshotPath = path.join(process.cwd(), 'mcp-files', 'screenshots', `linkedin-job-${Date.now()}.png`);
-            await fs.mkdir(path.dirname(screenshotPath), { recursive: true });
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-        }
-
-        await browser.close();
-
-        return {
-            ...jobData,
-            url,
-            scrapedAt: new Date().toISOString(),
-            ...(screenshotPath && { screenshot: screenshotPath }),
-        };
-    } catch (error) {
-        if (browser) await browser.close();
+async function readOptional(filename: string): Promise<string | undefined> {
+    try { return await sandboxReadText(filename); }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
         throw error;
     }
+}
+async function readJobs(): Promise<QueuedJob[]> {
+    const stored = await readOptional('jobs.json');
+    return stored === undefined ? [] : z.array(jobSchema).max(1000).parse(JSON.parse(stored));
+}
+function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>) {
+    return (req: Request, res: Response, next: NextFunction) => { void trackRequestWork(res, () => handler(req, res)).catch(next); };
+}
+function body<T extends z.ZodTypeAny>(schema: T, req: Request): z.infer<T> { return schema.parse(req.body); }
+function ai(res: Response) {
+    const service = getAIService();
+    if (!service.hasProvider()) { res.status(503).json({ error: 'AI is disabled or no provider is configured' }); return undefined; }
+    return service;
+}
+function pageText(html: string) {
+    return html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+export function createAPIRoutes(auth = createAuth()): Router {
+    const router = Router();
+    router.use(auth.protectOrigin);
+    router.use('/auth', auth.router);
+    router.use(auth.requireSession);
+    router.get('/status', (_req, res) => {
+        const service = getAIService();
+        res.json({ status: 'ok', version: '2.0.0', providers: service.getConfiguredProviders(), hasAI: service.hasProvider() });
+    });
+    router.post('/config', (_req, res) => res.status(403).json({ error: 'Runtime provider configuration is disabled' }));
+    router.post('/scrape-linkedin', (_req, res) => res.status(410).json({ error: 'Browser scraping is disabled. Paste the job description instead.' }));
+    router.post('/generate', asyncRoute(async (req, res) => {
+        const input = body(z.object({ prompt: text, provider }).strict(), req);
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.generateText(input.prompt, input.provider) });
+    }));
+    router.post('/extract-job', asyncRoute(async (req, res) => {
+        const input = body(z.object({ text: text.optional(), url: url.optional(), provider }).strict()
+            .refine(value => !!value.text || !!value.url), req);
+        let content = input.text ?? '';
+        if (input.url) content = pageText((await fetchPublicText(input.url, { timeoutMs: 8000, maxBytes: 200_000 })).text);
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.extractJobDetails(content, input.provider) });
+    }));
+    router.post('/analyze-resume', asyncRoute(async (req, res) => {
+        const input = body(z.object({ jobDescription: text, resumeText: text, provider }).strict(), req);
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.analyzeResume(input.jobDescription, input.resumeText, input.provider) });
+    }));
+    router.post('/draft-email', asyncRoute(async (req, res) => {
+        const input = body(z.object({ recipientName: short, companyName: short, jobTitle: short,
+            recipientRole: short.default('Team Member'), tone: z.enum(['Formal', 'Casual', 'Enthusiastic', 'Professional']).default('Professional'),
+            intent: z.enum(['Connect', 'FollowUp', 'ReferralRequest', 'PeerOutreach']).default('Connect'),
+            jobDescription: text.optional(), userBackground: text.optional(), provider }).strict(), req);
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.draftEmail(input, input.provider) });
+    }));
+    router.get('/resume', asyncRoute(async (_req, res) => {
+        const stored = await readOptional('resume.txt') ?? '';
+        res.json({ success: true, text: stored, hasResume: stored.length > 0 });
+    }));
+    router.post('/resume', asyncRoute(async (req, res) => {
+        const input = body(z.object({ text: z.string().max(200_000) }).strict(), req);
+        await serialize(() => sandboxWriteText('resume.txt', input.text, true));
+        res.json({ success: true, message: 'Resume saved', length: input.text.length });
+    }));
+    router.post('/research', asyncRoute(async (req, res) => {
+        const input = body(z.object({ companyName: short, url: url.optional(), provider }).strict(), req);
+        const content = input.url ? pageText((await fetchPublicText(input.url, { timeoutMs: 8000, maxBytes: 200_000 })).text) : undefined;
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.researchCompany(input.companyName, content, input.provider),
+            fetchedUrl: input.url && content ? input.url : null });
+    }));
+    router.post('/parse-jd', asyncRoute(async (req, res) => {
+        const input = body(z.object({ description: text, provider }).strict(), req);
+        const service = ai(res); if (!service) return;
+        res.json({ success: true, ...await service.parseJobDescription(input.description, input.provider) });
+    }));
+    router.get('/profile', asyncRoute(async (_req, res) => {
+        const stored = await readOptional('profile.json');
+        res.json({ success: stored !== undefined, profile: stored ? JSON.parse(stored) : null });
+    }));
+    router.post('/profile', asyncRoute(async (req, res) => {
+        const input = body(z.object({ rawText: text, provider }).strict(), req);
+        const service = ai(res); if (!service) return;
+        const result = await service.parseProfile(input.rawText, input.provider);
+        await serialize(() => sandboxWriteText('profile.json', JSON.stringify(result.data), true));
+        res.json({ success: true, profile: result.data, provider: result.provider });
+    }));
+    router.post('/jobs', asyncRoute(async (req, res) => {
+        const job = body(jobSchema.strict(), req);
+        const duplicate = await serialize(async () => {
+            const jobs = await readJobs();
+            if (jobs.some(other => (other.url && other.url === job.url) || other.title === job.title && other.company === job.company)) return true;
+            if (jobs.length >= 1000) throw new Error('Queue limit');
+            jobs.push({ ...job, id: randomUUID() });
+            await sandboxWriteText('jobs.json', JSON.stringify(jobs), true);
+            return false;
+        });
+        res.json({ success: true, message: duplicate ? 'Job already queued' : 'Job saved to queue', isDuplicate: duplicate });
+    }));
+    router.get('/jobs', asyncRoute(async (_req, res) => {
+        const jobs = await readJobs();
+        res.json({ success: true, count: jobs.length, data: jobs });
+    }));
+    router.delete('/jobs/:id', asyncRoute(async (req, res) => {
+        const id = short.parse(req.params.id);
+        await serialize(async () => {
+            const jobs = await readJobs();
+            await sandboxWriteText('jobs.json', JSON.stringify(jobs.filter(job => job.id !== id)), true);
+        });
+        res.json({ success: true, message: 'Job deleted' });
+    }));
+    router.delete('/jobs', asyncRoute(async (_req, res) => {
+        await serialize(() => sandboxWriteText('jobs.json', '[]', true));
+        res.json({ success: true, message: 'Job queue cleared' });
+    }));
+    router.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+        res.status(error instanceof z.ZodError ? 400 : 500).json({ error: error instanceof z.ZodError ? 'Invalid request fields' : 'Request failed' });
+    });
+    return router;
 }
